@@ -1,1 +1,1 @@
-{"name":"ref0","version":"0.48.0","description":"Connects this machine's Codex sessions to ref0","hooks":"./hooks/codex-hooks.json","skills":"./codex-skills"}
+{"name":"ref0","version":"0.49.0","description":"Connects this machine's Codex sessions to ref0","hooks":"./hooks/codex-hooks.json","skills":"./codex-skills"}
