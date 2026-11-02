@@ -5,7 +5,7 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const hooks = {"hook":"hook","start":"session-start","UserPromptSubmit":"user-prompt-submit","PreToolUse":"pre-tool-use","PostToolUse":"post-tool-use","PostToolUseFailure":"post-tool-use-failure","Stop":"stop","SubagentStart":"subagent-start","SubagentStop":"subagent-stop","shown":"shown"};
+const hooks = {"hook":"hook","start":"session-start","UserPromptSubmit":"user-prompt-submit","PreToolUse":"pre-tool-use","PostToolUse":"post-tool-use","PostToolUseFailure":"post-tool-use-failure","Stop":"stop","SubagentStart":"subagent-start","SubagentStop":"subagent-stop","shown":"shown","record":"record"};
 const textBytes = 10000;
 const mostSteps = 2000;
 const mostPrompts = 100;
@@ -20,6 +20,17 @@ const settleMs = 2_000;
 const shellTool = 'shell';
 const mostAgentShells = 64;
 const shellTag = /\n# ref0 shell ([0-9a-f]{16})$/;
+// The recording's fields, the callbacks it keeps, how many go to one `record` at most, how many
+// and how many bytes wait at most, and the most bytes one may take: past a bound, one is counted
+// `lost`, so OpenCode's process holds at most a few MB for a recording.
+const recordedAt = "recordedAt";
+const recordingSaid = "recording";
+const recorded = new Set(["tool.execute.before","shell.create.before","context","session.created","session.step.started","session.step.ended","session.step.failed","session.execution.interrupted","session.execution.failed","session.deleted","server.connected","lost"]);
+const shellVariables = ["REF0_HARNESS", "REF0_MODEL", "OPENCODE_SESSION_ID"];
+const mostRecords = 64;
+const mostWaitingRecords = 1024;
+const mostWaitingBytes = 4 * 1024 * 1024;
+const mostRecordBytes = 65_536;
 
 // The origin's launcher, where the origin keeps its releases and it: none outside that layout.
 const launcherOf = (folder) => {
@@ -73,6 +84,9 @@ const manifestOf = (folder) => {
 };
 
 const bytes = (text) => Buffer.byteLength(text, 'utf8');
+
+// Now, in microseconds since the epoch, as a recording's steps are ordered by.
+const now = () => Math.round((performance.timeOrigin + performance.now()) * 1000);
 
 export default {
   id: 'ref0',
@@ -155,8 +169,54 @@ export default {
     // whose session they carry.
     const waitingFor = (session) => (session.root ?? session).waiting.length > 0;
 
-    const send = async (session, name, fields) =>
-      queue(session, await run(name, waitingFor(session) ? { ...fields, waiting: 'yes' } : fields, session.directory));
+    // Whether a recording lease held, as the hook client's last answer said.
+    let recording = false;
+
+    const send = async (session, name, fields) => {
+      const sent = waitingFor(session) ? { ...fields, waiting: 'yes' } : fields;
+      const answer = await run(name, recording ? { ...sent, [recordedAt]: now() } : sent, session.directory);
+      recording = answer?.[recordingSaid] === true;
+      queue(session, answer);
+    };
+
+    // The callbacks that send no hook, while a lease holds, each as it came, for the hook client's
+    // `record`, one batch at a time, and how many were lost past the bounds since the last.
+    const records = [];
+    let waitingBytes = 0;
+    let lost = 0;
+    let recordingNow = false;
+
+    const flush = async () => {
+      recordingNow = true;
+      while (records.length > 0 || lost > 0) {
+        const batch = records.splice(0, mostRecords);
+        for (const one of batch) waitingBytes -= one.bytes;
+        if (lost > 0) batch.push({ record: { at: now(), event: 'lost', input: { count: lost } }, bytes: 0 });
+        lost = 0;
+        await run(hooks.record, { records: batch.map((one) => one.record) }, undefined);
+      }
+      recordingNow = false;
+    };
+
+    const record = (event, session, directory, input) => {
+      if (!recording || !recorded.has(event)) return;
+
+      const one = {
+        at: now(),
+        event,
+        ...(typeof session === 'string' ? { session } : {}),
+        ...(typeof directory === 'string' ? { directory } : {}),
+        input,
+      };
+      const size = bytes(JSON.stringify(one));
+      if (records.length >= mostWaitingRecords || size > mostRecordBytes || waitingBytes + size > mostWaitingBytes)
+        lost += 1;
+      else {
+        records.push({ record: one, bytes: size });
+        waitingBytes += size;
+      }
+      if (!recordingNow) void flush();
+    };
 
     // The session as first seen: its parent's first, then its own start.
     const seen = new Map();
@@ -269,11 +329,18 @@ export default {
     };
 
     await ctx.tool.hook('execute.before', (e) => {
+      if (e.tool === shellTool && typeof e.input?.command === 'string')
+        record('tool.execute.before', e.sessionID, sessions.get(e.sessionID)?.directory, {
+          sessionID: e.sessionID,
+          id: e.id,
+          tool: e.tool,
+          command: e.input.command,
+        });
       // The tool gets a copy of the call's input, which the session doesn't keep, its command
       // tagged for this call alone.
       if (git !== undefined && e.tool === shellTool && typeof e.input?.command === 'string') {
         const tag = randomBytes(8).toString('hex');
-        agentShells.set(tag, models.get(e.sessionID));
+        agentShells.set(tag, { model: models.get(e.sessionID), sessionID: e.sessionID, id: e.id });
         if (agentShells.size > mostAgentShells) agentShells.delete(agentShells.keys().next().value);
         e.input = { ...e.input, command: e.input.command + '\n# ref0 shell ' + tag };
       }
@@ -331,6 +398,7 @@ export default {
         count += 1;
       }
       const told = session.waiting.splice(0, count);
+      record('context', e.sessionID, session.directory, { sessionID: e.sessionID, told: told.length });
       for (const one of told) e.system.push({ type: 'text', text: one.text });
       for (const one of told)
         if (typeof one.tell === 'string') void run(hooks.shown, { tell: one.tell }, session.directory);
@@ -360,6 +428,17 @@ export default {
       ];
       for await (const event of ctx.event.subscribe({ types })) {
         const data = event.data ?? {};
+        // Only the fields the plugin reads.
+        record(
+          event.type,
+          data.sessionID,
+          sessions.get(data.sessionID)?.directory,
+          Object.fromEntries(
+            ['sessionID', 'assistantMessageID', 'model', 'tokens']
+              .filter((key) => data[key] !== undefined)
+              .map((key) => [key, data[key]]),
+          ),
+        );
         if (event.type === 'server.connected') {
           // Events may have been missed while the stream reconnected.
           for (const tally of tallies.values()) tally.whole = false;
@@ -432,24 +511,38 @@ export default {
     // writes, and the model its session's latest step named: OpenCode's hook for it names neither
     // session nor call, so the call tags its command, and the hook takes the tag out before the
     // shell runs. A shell the person starts, as OpenCode's shell mode does, has no call and gets
-    // neither.
+    // neither. Each is recorded as it starts, with what its environment then names of the agent
+    // and the session.
     if (git !== undefined) {
-      const include = quoted('include.path=' + join(git, "agent.gitconfig"));
+      const agentFile = join(git, "agent.gitconfig");
+      const include = quoted('include.path=' + agentFile);
+      const recordShell = (e, call) =>
+        record('shell.create.before', call?.sessionID ?? e.env?.OPENCODE_SESSION_ID, e.cwd, {
+          ...(call === undefined ? {} : { sessionID: call.sessionID, id: call.id }),
+          command: e.command,
+          cwd: e.cwd,
+          agent: call !== undefined,
+          environment: Object.fromEntries(
+            shellVariables.filter((name) => typeof e.env?.[name] === 'string').map((name) => [name, e.env[name]]),
+          ),
+          ...(call === undefined ? {} : { include: agentFile }),
+        });
       await ctx.shell.hook('create.before', (e) => {
         const tagged = shellTag.exec(e.command);
-        if (tagged === null) return;
+        if (tagged === null) return recordShell(e, undefined);
 
         e.command = e.command.slice(0, tagged.index);
         // A call forgotten past the bound starts its shell as the person's.
-        if (!agentShells.has(tagged[1])) return;
+        if (!agentShells.has(tagged[1])) return recordShell(e, undefined);
 
-        const model = agentShells.get(tagged[1]);
+        const call = agentShells.get(tagged[1]);
         agentShells.delete(tagged[1]);
         const before = e.env.GIT_CONFIG_PARAMETERS ?? '';
         e.env.GIT_CONFIG_PARAMETERS = before === '' ? include : before + ' ' + include;
         e.env.REF0_HARNESS = "opencode";
-        if (model === undefined) delete e.env.REF0_MODEL;
-        else e.env.REF0_MODEL = model;
+        if (call.model === undefined) delete e.env.REF0_MODEL;
+        else e.env.REF0_MODEL = call.model;
+        recordShell(e, call);
       });
     }
   },
