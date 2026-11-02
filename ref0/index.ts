@@ -70,6 +70,18 @@ const gitFolderOf = (origin, env) => {
   }
 };
 
+// The key Git takes an include under only in a checkout the origin keyed `key` holds, one with a
+// remote there, as the CLI's `heldInclude` names it: none for a key that names no origin.
+const heldKeyOf = (key) => {
+  try {
+    const origin = new URL(decodeURIComponent(key)).origin;
+
+    return 'includeIf.hasconfig:remote.*.url:' + origin.replaceAll(/[\\*?[]/g, '\\$&') + '/**.path';
+  } catch {
+    return undefined;
+  }
+};
+
 // A word as Git's `GIT_CONFIG_PARAMETERS` quotes it.
 const quoted = (word) => "'" + word.replaceAll("'", "'\\''") + "'";
 
@@ -96,7 +108,10 @@ export default {
     const manifest = manifestOf(folder);
     if (launcher === undefined || manifest === undefined) return;
 
-    const git = gitFolderOf(dirname(dirname(dirname(folder))), process.env);
+    const origin = dirname(dirname(dirname(folder)));
+    // The agent's shells are set up only where both can be named.
+    const heldKey = heldKeyOf(basename(origin));
+    const git = heldKey === undefined ? undefined : gitFolderOf(origin, process.env);
     const environment = {
       ...process.env,
       REF0_PLUGIN_VERSION: manifest.version,
@@ -508,14 +523,14 @@ export default {
     void watch().catch(() => {});
 
     // A shell the agent's shell tool starts names the agent's include, which a session's start
-    // writes, and the model its session's latest step named: OpenCode's hook for it names neither
+    // writes, under the key Git takes it by in a checkout the origin holds alone, and the model its session's latest step named: OpenCode's hook for it names neither
     // session nor call, so the call tags its command, and the hook takes the tag out before the
     // shell runs. A shell the person starts, as OpenCode's shell mode does, has no call and gets
     // neither. Each is recorded as it starts, with what its environment then names of the agent
     // and the session.
     if (git !== undefined) {
       const agentFile = join(git, "agent.gitconfig");
-      const include = quoted('include.path=' + agentFile);
+      const include = quoted(heldKey + '=' + agentFile);
       const recordShell = (e, call) =>
         record('shell.create.before', call?.sessionID ?? e.env?.OPENCODE_SESSION_ID, e.cwd, {
           ...(call === undefined ? {} : { sessionID: call.sessionID, id: call.id }),
